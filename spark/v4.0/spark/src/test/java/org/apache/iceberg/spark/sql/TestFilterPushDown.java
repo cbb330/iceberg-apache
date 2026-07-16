@@ -45,6 +45,7 @@ import org.apache.iceberg.variants.Variants;
 import org.apache.spark.sql.execution.SparkPlan;
 import org.apache.spark.unsafe.types.VariantVal;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.TestTemplate;
 import org.junit.jupiter.api.extension.ExtendWith;
 
@@ -687,6 +688,45 @@ public class TestFilterPushDown extends TestBaseWithCatalog {
     assertThat(sql("SELECT * FROM %s WHERE c = 'CA'", tableName))
         .containsExactly(row(3L, "Eve", "CA"));
     assertThat(sql("SELECT * FROM %s WHERE c IS NULL", tableName)).isEmpty();
+  }
+
+  @TestTemplate
+  @Disabled(
+      "BaseParquetReaders' constant-default reader has no real per-row definition-level source "
+          + "when a nested default field is the only referenced field of its struct, so it can't "
+          + "detect that the ancestor struct is null and applies the default unconditionally")
+  public void testFilterPushdownOnNestedInitialDefaultColumnAbsentFromFile() {
+    sql(
+        "CREATE TABLE %s (id BIGINT, loc STRUCT<city: STRING>) USING iceberg "
+            + "TBLPROPERTIES ('format-version' = '3')",
+        tableName);
+    configurePlanningMode(planningMode);
+
+    sql(
+        "INSERT INTO %s VALUES (1, named_struct('city', 'San Francisco')), (2, NULL)",
+        tableName);
+
+    Table table = validationCatalog.loadTable(tableIdent);
+    table
+        .updateSchema()
+        .addColumn("loc", "country", Types.StringType.get(), Expressions.lit("US"))
+        .commit();
+    sql("REFRESH TABLE %s", tableName);
+
+    sql(
+        "INSERT INTO %s VALUES (3, named_struct('city', 'Toronto', 'country', 'CA'))",
+        tableName);
+
+    assertThat(sql("SELECT id FROM %s WHERE loc.country = 'US'", tableName))
+        .containsExactly(row(1L));
+
+    // row 2's ancestor struct loc is itself null, so loc.country must read as null, not
+    // as the default 'US'
+    assertThat(sql("SELECT id FROM %s WHERE loc.country IS NULL", tableName))
+        .containsExactly(row(2L));
+
+    assertThat(sql("SELECT id FROM %s WHERE loc.country = 'CA'", tableName))
+        .containsExactly(row(3L));
   }
 
   private void checkOnlyIcebergFilters(
