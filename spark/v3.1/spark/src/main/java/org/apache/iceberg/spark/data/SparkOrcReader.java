@@ -16,46 +16,47 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-package org.apache.iceberg.data.orc;
+package org.apache.iceberg.spark.data;
 
-import java.util.Collections;
 import java.util.List;
 import java.util.Map;
-import org.apache.iceberg.Schema;
-import org.apache.iceberg.data.Record;
 import org.apache.iceberg.orc.OrcRowReader;
 import org.apache.iceberg.orc.OrcSchemaWithTypeVisitor;
 import org.apache.iceberg.orc.OrcValueReader;
 import org.apache.iceberg.orc.OrcValueReaders;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.types.Type;
 import org.apache.iceberg.types.Types;
 import org.apache.orc.TypeDescription;
 import org.apache.orc.storage.ql.exec.vector.StructColumnVector;
 import org.apache.orc.storage.ql.exec.vector.VectorizedRowBatch;
+import org.apache.spark.sql.catalyst.InternalRow;
 
-public class GenericOrcReader implements OrcRowReader<Record> {
+/**
+ * Converts the OrcIterator, which returns ORC's VectorizedRowBatch to a set of Spark's UnsafeRows.
+ *
+ * <p>It minimizes allocations by reusing most of the objects in the implementation.
+ */
+public class SparkOrcReader implements OrcRowReader<InternalRow> {
   private final OrcValueReader<?> reader;
 
-  public GenericOrcReader(
-      Schema expectedSchema, TypeDescription readOrcSchema, Map<Integer, ?> idToConstant) {
+  public SparkOrcReader(org.apache.iceberg.Schema expectedSchema, TypeDescription readSchema) {
+    this(expectedSchema, readSchema, ImmutableMap.of());
+  }
+
+  @SuppressWarnings("unchecked")
+  public SparkOrcReader(
+      org.apache.iceberg.Schema expectedSchema,
+      TypeDescription readOrcSchema,
+      Map<Integer, ?> idToConstant) {
     this.reader =
         OrcSchemaWithTypeVisitor.visit(
             expectedSchema, readOrcSchema, new ReadBuilder(idToConstant));
   }
 
-  public static OrcRowReader<Record> buildReader(
-      Schema expectedSchema, TypeDescription fileSchema) {
-    return new GenericOrcReader(expectedSchema, fileSchema, Collections.emptyMap());
-  }
-
-  public static OrcRowReader<Record> buildReader(
-      Schema expectedSchema, TypeDescription fileSchema, Map<Integer, ?> idToConstant) {
-    return new GenericOrcReader(expectedSchema, fileSchema, idToConstant);
-  }
-
   @Override
-  public Record read(VectorizedRowBatch batch, int row) {
-    return (Record) reader.read(new StructColumnVector(batch.size, batch.cols), row);
+  public InternalRow read(VectorizedRowBatch batch, int row) {
+    return (InternalRow) reader.read(new StructColumnVector(batch.size, batch.cols), row);
   }
 
   @Override
@@ -76,13 +77,13 @@ public class GenericOrcReader implements OrcRowReader<Record> {
         TypeDescription record,
         List<String> names,
         List<OrcValueReader<?>> fields) {
-      return GenericOrcReaders.struct(record, fields, expected, idToConstant);
+      return SparkOrcValueReaders.struct(record, fields, expected, idToConstant);
     }
 
     @Override
     public OrcValueReader<?> list(
         Types.ListType iList, TypeDescription array, OrcValueReader<?> elementReader) {
-      return GenericOrcReaders.array(elementReader);
+      return SparkOrcValueReaders.array(elementReader);
     }
 
     @Override
@@ -91,15 +92,11 @@ public class GenericOrcReader implements OrcRowReader<Record> {
         TypeDescription map,
         OrcValueReader<?> keyReader,
         OrcValueReader<?> valueReader) {
-      return GenericOrcReaders.map(keyReader, valueReader);
+      return SparkOrcValueReaders.map(keyReader, valueReader);
     }
 
     @Override
     public OrcValueReader<?> primitive(Type.PrimitiveType iPrimitive, TypeDescription primitive) {
-      if (iPrimitive == null) {
-        return null;
-      }
-
       switch (primitive.getCategory()) {
         case BOOLEAN:
           return OrcValueReaders.booleans();
@@ -107,51 +104,26 @@ public class GenericOrcReader implements OrcRowReader<Record> {
           // Iceberg does not have a byte type. Use int
         case SHORT:
           // Iceberg does not have a short type. Use int
+        case DATE:
         case INT:
           return OrcValueReaders.ints();
         case LONG:
-          switch (iPrimitive.typeId()) {
-            case TIME:
-              return GenericOrcReaders.times();
-            case LONG:
-              return OrcValueReaders.longs();
-            default:
-              throw new IllegalStateException(
-                  String.format(
-                      "Invalid iceberg type %s corresponding to ORC type %s",
-                      iPrimitive, primitive));
-          }
-
+          return OrcValueReaders.longs();
         case FLOAT:
           return OrcValueReaders.floats();
         case DOUBLE:
           return OrcValueReaders.doubles();
-        case DATE:
-          return GenericOrcReaders.dates();
-        case TIMESTAMP:
-          return GenericOrcReaders.timestamps();
         case TIMESTAMP_INSTANT:
-          return GenericOrcReaders.timestampTzs();
+        case TIMESTAMP:
+          return SparkOrcValueReaders.timestampTzs();
         case DECIMAL:
-          return GenericOrcReaders.decimals();
+          return SparkOrcValueReaders.decimals(primitive.getPrecision(), primitive.getScale());
         case CHAR:
         case VARCHAR:
         case STRING:
-          return GenericOrcReaders.strings();
+          return SparkOrcValueReaders.utf8String();
         case BINARY:
-          switch (iPrimitive.typeId()) {
-            case UUID:
-              return GenericOrcReaders.uuids();
-            case FIXED:
-              return OrcValueReaders.bytes();
-            case BINARY:
-              return GenericOrcReaders.bytes();
-            default:
-              throw new IllegalStateException(
-                  String.format(
-                      "Invalid iceberg type %s corresponding to ORC type %s",
-                      iPrimitive, primitive));
-          }
+          return OrcValueReaders.bytes();
         default:
           throw new IllegalArgumentException("Unhandled type " + primitive);
       }
