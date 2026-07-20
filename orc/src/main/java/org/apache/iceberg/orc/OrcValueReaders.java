@@ -22,7 +22,10 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import org.apache.iceberg.MetadataColumns;
+import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
+import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.types.Types;
+import org.apache.orc.TypeDescription;
 import org.apache.orc.storage.ql.exec.vector.BytesColumnVector;
 import org.apache.orc.storage.ql.exec.vector.ColumnVector;
 import org.apache.orc.storage.ql.exec.vector.DoubleColumnVector;
@@ -134,12 +137,25 @@ public class OrcValueReaders {
   public abstract static class StructReader<T> implements OrcValueReader<T> {
     private final OrcValueReader<?>[] readers;
     private final boolean[] isConstantOrMetadataField;
+    // Maps each expected field position to the ORC column index it should read from. Only used by
+    // the id-based binding constructor; left null by the deprecated positional constructor so that
+    // {@link #readInternal} preserves the exact positional behavior for readers that have not been
+    // converted to id-based binding.
+    private final int[] orcFieldIndex;
 
+    /**
+     * @deprecated since 1.2.1, positional binding assumes the projected field order matches the
+     *     file's physical column order. Use {@link #StructReader(TypeDescription, List,
+     *     Types.StructType, Map)} for id-based binding instead. Kept for engine readers that have
+     *     not yet migrated.
+     */
+    @Deprecated
     protected StructReader(
         List<OrcValueReader<?>> readers, Types.StructType struct, Map<Integer, ?> idToConstant) {
       List<Types.NestedField> fields = struct.fields();
       this.readers = new OrcValueReader[fields.size()];
       this.isConstantOrMetadataField = new boolean[fields.size()];
+      this.orcFieldIndex = null;
       for (int pos = 0, readerIndex = 0; pos < fields.size(); pos += 1) {
         Types.NestedField field = fields.get(pos);
         if (idToConstant.containsKey(field.fieldId())) {
@@ -161,6 +177,71 @@ public class OrcValueReaders {
       }
     }
 
+    protected StructReader(
+        TypeDescription orcType,
+        List<OrcValueReader<?>> readers,
+        Types.StructType struct,
+        Map<Integer, ?> idToConstant) {
+      List<Types.NestedField> fields = struct.fields();
+      this.readers = new OrcValueReader[fields.size()];
+      this.isConstantOrMetadataField = new boolean[fields.size()];
+      this.orcFieldIndex = new int[fields.size()];
+
+      Map<Integer, OrcValueReader<?>> readersById = readersByFieldId(orcType, readers);
+      Map<Integer, Integer> fieldIdToOrcIndex = buildFieldIdToOrcIndex(orcType);
+
+      for (int pos = 0; pos < fields.size(); pos += 1) {
+        Types.NestedField field = fields.get(pos);
+        OrcValueReader<?> fileReader = readersById.get(field.fieldId());
+
+        if (idToConstant.containsKey(field.fieldId())) {
+          this.isConstantOrMetadataField[pos] = true;
+          this.readers[pos] = constants(idToConstant.get(field.fieldId()));
+        } else if (field.equals(MetadataColumns.ROW_POSITION)) {
+          this.isConstantOrMetadataField[pos] = true;
+          this.readers[pos] = new RowPositionReader();
+        } else if (field.equals(MetadataColumns.IS_DELETED)) {
+          this.isConstantOrMetadataField[pos] = true;
+          this.readers[pos] = constants(false);
+        } else if (fileReader != null) {
+          this.isConstantOrMetadataField[pos] = false;
+          this.orcFieldIndex[pos] = fieldIdToOrcIndex.getOrDefault(field.fieldId(), -1);
+          this.readers[pos] = fileReader;
+        } else if (MetadataColumns.isMetadataColumn(field.name())) {
+          // in case of any other metadata field, fill with nulls
+          this.isConstantOrMetadataField[pos] = true;
+          this.readers[pos] = constants(null);
+        } else {
+          throw new IllegalArgumentException(
+              String.format("Missing ORC reader for field %s (%s)", field.name(), field.fieldId()));
+        }
+      }
+    }
+
+    private Map<Integer, Integer> buildFieldIdToOrcIndex(TypeDescription orcType) {
+      List<TypeDescription> children = orcType.getChildren();
+      Map<Integer, Integer> mapping = Maps.newHashMap();
+      for (int i = 0; i < children.size(); i++) {
+        mapping.put(ORCSchemaUtil.fieldId(children.get(i)), i);
+      }
+      return mapping;
+    }
+
+    private Map<Integer, OrcValueReader<?>> readersByFieldId(
+        TypeDescription orcType, List<OrcValueReader<?>> readerList) {
+      List<TypeDescription> children = orcType.getChildren();
+      Preconditions.checkState(
+          children.size() == readerList.size(),
+          "Invalid ORC reader binding: children=%s readers=%s",
+          children.size(),
+          readerList.size());
+      Map<Integer, OrcValueReader<?>> readersById = Maps.newHashMap();
+      for (int i = 0; i < children.size(); i += 1) {
+        readersById.put(ORCSchemaUtil.fieldId(children.get(i)), readerList.get(i));
+      }
+      return readersById;
+    }
+
     protected abstract T create();
 
     protected abstract void set(T struct, int pos, Object value);
@@ -176,13 +257,15 @@ public class OrcValueReaders {
     }
 
     private T readInternal(T struct, ColumnVector[] columnVectors, int row) {
-      for (int c = 0, vectorIndex = 0; c < readers.length; ++c) {
+      int vectorIndex = 0;
+      for (int c = 0; c < readers.length; ++c) {
         ColumnVector vector;
         if (isConstantOrMetadataField[c]) {
           vector = null;
+        } else if (orcFieldIndex != null) {
+          vector = columnVectors[orcFieldIndex[c]];
         } else {
-          vector = columnVectors[vectorIndex];
-          vectorIndex++;
+          vector = columnVectors[vectorIndex++];
         }
         set(struct, c, reader(c).read(vector, row));
       }
