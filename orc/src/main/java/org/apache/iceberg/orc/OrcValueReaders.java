@@ -24,7 +24,6 @@ import java.util.Map;
 import org.apache.iceberg.MetadataColumns;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
-import org.apache.iceberg.types.Type;
 import org.apache.iceberg.types.Types;
 import org.apache.orc.TypeDescription;
 import org.apache.orc.storage.ql.exec.vector.BytesColumnVector;
@@ -149,7 +148,7 @@ public class OrcValueReaders {
      * @param idToConstant constant values by field id
      * @deprecated Use {@link #StructReader(TypeDescription, List, Types.StructType, Map)} instead.
      *     This constructor uses position-based binding which may cause field misalignment in MOR
-     *     scenarios. This doesn't work lineage scenarios.
+     *     scenarios.
      */
     @Deprecated
     protected StructReader(
@@ -170,8 +169,7 @@ public class OrcValueReaders {
         } else if (field.equals(MetadataColumns.IS_DELETED)) {
           this.isConstantOrMetadataField[pos] = true;
           this.readers[pos] = constants(false);
-        } else if (MetadataColumns.isMetadataColumn(field.name())
-            || field.type().typeId() == Type.TypeID.UNKNOWN) {
+        } else if (MetadataColumns.isMetadataColumn(field.name())) {
           this.isConstantOrMetadataField[pos] = true;
           this.readers[pos] = constants(null);
         } else {
@@ -196,13 +194,8 @@ public class OrcValueReaders {
       for (int pos = 0; pos < fields.size(); pos += 1) {
         Types.NestedField field = fields.get(pos);
         OrcValueReader<?> fileReader = readersById.get(field.fieldId());
-        int orcIndex = fieldIdToOrcIndex.getOrDefault(field.fieldId(), -1);
 
-        if (field.equals(MetadataColumns.ROW_ID)) {
-          handleRowIdField(pos, field, fileReader, idToConstant, orcIndex);
-        } else if (field.equals(MetadataColumns.LAST_UPDATED_SEQUENCE_NUMBER)) {
-          handleLastUpdatedSeqField(pos, field, fileReader, idToConstant, orcIndex);
-        } else if (idToConstant.containsKey(field.fieldId())) {
+        if (idToConstant.containsKey(field.fieldId())) {
           this.isConstantOrMetadataField[pos] = true;
           this.readers[pos] = constants(idToConstant.get(field.fieldId()));
         } else if (field.equals(MetadataColumns.ROW_POSITION)) {
@@ -215,8 +208,7 @@ public class OrcValueReaders {
           this.isConstantOrMetadataField[pos] = false;
           this.orcFieldIndex[pos] = fieldIdToOrcIndex.getOrDefault(field.fieldId(), -1);
           this.readers[pos] = fileReader;
-        } else if (MetadataColumns.isMetadataColumn(field.name())
-            || field.type().typeId() == Type.TypeID.UNKNOWN) {
+        } else if (MetadataColumns.isMetadataColumn(field.name())) {
           this.isConstantOrMetadataField[pos] = true;
           this.readers[pos] = constants(null);
         } else {
@@ -251,49 +243,6 @@ public class OrcValueReaders {
       }
 
       return readersById;
-    }
-
-    @SuppressWarnings("unchecked")
-    private void handleRowIdField(
-        int pos,
-        Types.NestedField field,
-        OrcValueReader<?> fileReader,
-        Map<Integer, ?> idToConstant,
-        int orcIndex) {
-      Long firstRowId = (Long) idToConstant.get(field.fieldId());
-      if (firstRowId != null) {
-        OrcValueReader<Long> fileIdReader = (OrcValueReader<Long>) fileReader;
-        this.readers[pos] = new RowIdReader(firstRowId, fileIdReader);
-        this.isConstantOrMetadataField[pos] = fileIdReader == null;
-        if (fileIdReader != null) {
-          this.orcFieldIndex[pos] = orcIndex;
-        }
-      } else {
-        this.isConstantOrMetadataField[pos] = true;
-        this.readers[pos] = constants(null);
-      }
-    }
-
-    @SuppressWarnings("unchecked")
-    private void handleLastUpdatedSeqField(
-        int pos,
-        Types.NestedField field,
-        OrcValueReader<?> fileReader,
-        Map<Integer, ?> idToConstant,
-        int orcIndex) {
-      Long fileLastUpdated = (Long) idToConstant.get(field.fieldId());
-      Long firstRowId = (Long) idToConstant.get(MetadataColumns.ROW_ID.fieldId());
-      if (fileLastUpdated != null && firstRowId != null) {
-        OrcValueReader<Long> fileSeqReader = (OrcValueReader<Long>) fileReader;
-        this.readers[pos] = new LastUpdatedSeqReader(fileLastUpdated, fileSeqReader);
-        this.isConstantOrMetadataField[pos] = fileSeqReader == null;
-        if (fileSeqReader != null) {
-          this.orcFieldIndex[pos] = orcIndex;
-        }
-      } else {
-        this.isConstantOrMetadataField[pos] = true;
-        this.readers[pos] = constants(null);
-      }
     }
 
     protected abstract T create();
@@ -369,78 +318,6 @@ public class OrcValueReaders {
     @Override
     public void setBatchContext(long newBatchOffsetInFile) {
       this.batchOffsetInFile = newBatchOffsetInFile;
-    }
-  }
-
-  private static class RowIdReader implements OrcValueReader<Long> {
-    private final long firstRowId;
-    private final OrcValueReader<Long> fileIdReader;
-    private final RowPositionReader posReader;
-
-    RowIdReader(long firstRowId, OrcValueReader<Long> fileIdReader) {
-      this.firstRowId = firstRowId;
-      this.fileIdReader = fileIdReader;
-      this.posReader = new RowPositionReader();
-    }
-
-    @Override
-    public Long read(ColumnVector vector, int row) {
-      if (fileIdReader != null) {
-        Long idFromFile = fileIdReader.read(vector, row);
-        if (idFromFile != null) {
-          return idFromFile;
-        }
-      }
-
-      long pos = posReader.read(null, row);
-      return firstRowId + pos;
-    }
-
-    @Override
-    public Long nonNullRead(ColumnVector vector, int row) {
-      return read(vector, row);
-    }
-
-    @Override
-    public void setBatchContext(long batchOffsetInFile) {
-      posReader.setBatchContext(batchOffsetInFile);
-      if (fileIdReader != null) {
-        fileIdReader.setBatchContext(batchOffsetInFile);
-      }
-    }
-  }
-
-  private static class LastUpdatedSeqReader implements OrcValueReader<Long> {
-    private final long fileLastUpdated;
-    private final OrcValueReader<Long> fileSeqReader;
-
-    LastUpdatedSeqReader(long fileLastUpdated, OrcValueReader<Long> fileSeqReader) {
-      this.fileLastUpdated = fileLastUpdated;
-      this.fileSeqReader = fileSeqReader;
-    }
-
-    @Override
-    public Long read(ColumnVector vector, int row) {
-      if (fileSeqReader != null) {
-        Long seqFromFile = fileSeqReader.read(vector, row);
-        if (seqFromFile != null) {
-          return seqFromFile;
-        }
-      }
-
-      return fileLastUpdated;
-    }
-
-    @Override
-    public Long nonNullRead(ColumnVector vector, int row) {
-      return read(vector, row);
-    }
-
-    @Override
-    public void setBatchContext(long batchOffsetInFile) {
-      if (fileSeqReader != null) {
-        fileSeqReader.setBatchContext(batchOffsetInFile);
-      }
     }
   }
 }
